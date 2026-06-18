@@ -1,0 +1,247 @@
+#define BLYNK_TEMPLATE_ID "---"
+#define BLYNK_TEMPLATE_NAME "Automata Ontozo"
+#define BLYNK_AUTH_TOKEN "---"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "---";
+char pass[] = "---";
+
+const int SOIL_PIN = 34;
+const int FLOAT_PIN = 27;
+const int PUMP_PIN = 26;
+
+const int DRY = 3200;
+const int WET = 1300;
+
+// Nedvesség határok
+const int START_WATERING_THRESHOLD = 35;
+const int STOP_WATERING_THRESHOLD = 40;
+
+// Időzítések
+const unsigned long WATERING_TIME_MS = 2000;    // 2 mp öntözés
+const unsigned long SOAK_WAIT_MS = 10000;       // teszthez 10 mp, később 300000 = 5 perc, hogy a víz elterjedjen
+const int MAX_WATERING_CYCLES = 3;
+
+// Blynk frissítés
+const unsigned long BLYNK_UPDATE_INTERVAL_MS = 2000;
+unsigned long lastBlynkUpdate = 0;
+
+enum SystemState {
+  IDLE,
+  CHECK_SOIL,
+  WATERING,
+  SOAK_WAIT,
+  LOW_WATER_LOCKOUT,
+  ERROR_STATE
+};
+
+SystemState state = CHECK_SOIL;
+
+unsigned long stateStartTime = 0;
+int wateringCycles = 0;
+
+int lastRaw = 0;
+int lastPercent = 0;
+
+int readSoilAverage() {
+  long sum = 0;
+  const int samples = 20;
+
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(SOIL_PIN);
+    delay(10);
+  }
+
+  return sum / samples;
+}
+
+int rawToPercent(int raw) {
+  int percent = map(raw, DRY, WET, 0, 100);
+  percent = constrain(percent, 0, 100);
+  return percent;
+}
+
+bool isWaterLow() {
+  int floatState = digitalRead(FLOAT_PIN);
+
+  return floatState == HIGH;
+}
+
+String stateToText(SystemState s) {
+  if (s == IDLE) return "IDLE";
+  if (s == CHECK_SOIL) return "CHECK_SOIL";
+  if (s == WATERING) return "WATERING";
+  if (s == SOAK_WAIT) return "SOAK_WAIT";
+  if (s == LOW_WATER_LOCKOUT) return "LOW_WATER_LOCKOUT";
+  if (s == ERROR_STATE) return "ERROR_STATE";
+  return "UNKNOWN";
+}
+
+void pumpOff() {
+  digitalWrite(PUMP_PIN, LOW);
+}
+
+void pumpOn() {
+  digitalWrite(PUMP_PIN, HIGH);
+}
+
+void sendToBlynk() {
+  Blynk.virtualWrite(V0, lastPercent);
+
+  if (isWaterLow()) {
+    Blynk.virtualWrite(V1, "ALACSONY");
+  } else {
+    Blynk.virtualWrite(V1, "RENDBEN");
+  }
+
+  Blynk.virtualWrite(V2, stateToText(state));
+  Blynk.virtualWrite(V3, wateringCycles);
+}
+
+void changeState(SystemState newState) {
+  state = newState;
+  stateStartTime = millis();
+
+  Serial.print("UJ ALLAPOT: ");
+  Serial.println(stateToText(newState));
+
+  sendToBlynk();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(FLOAT_PIN, INPUT_PULLUP);
+  pinMode(PUMP_PIN, OUTPUT);
+
+  pumpOff();
+
+  Serial.println("Automata ontozorendszer + Blynk + pumpa indul");
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  Serial.println("Blynk kapcsolat kesz");
+
+  changeState(CHECK_SOIL);
+}
+
+void loop() {
+  Blynk.run();
+
+  if (millis() - lastBlynkUpdate >= BLYNK_UPDATE_INTERVAL_MS) {
+    lastBlynkUpdate = millis();
+    sendToBlynk();
+  }
+
+  // Vízszint ellenőrzés minden ciklus elején.
+  // Ha kevés a víz, pumpa azonnal OFF és tiltás.
+  if (state != LOW_WATER_LOCKOUT && isWaterLow()) {
+    pumpOff();
+    Serial.println("HIBA: alacsony vizszint, rendszer tiltva");
+    changeState(LOW_WATER_LOCKOUT);
+  }
+
+  switch (state) {
+
+    case CHECK_SOIL: {
+      lastRaw = readSoilAverage();
+      lastPercent = rawToPercent(lastRaw);
+
+      Serial.print("Raw atlag: ");
+      Serial.print(lastRaw);
+      Serial.print(" | Nedvesseg: ");
+      Serial.print(lastPercent);
+      Serial.println("%");
+
+      sendToBlynk();
+
+      if (lastPercent < START_WATERING_THRESHOLD) {
+        if (wateringCycles < MAX_WATERING_CYCLES) {
+          wateringCycles++;
+
+          Serial.print("ONTOZES SZUKSEGES. Ciklus: ");
+          Serial.println(wateringCycles);
+
+          Serial.println("PUMPA INDUL 2 MASODPERCRE");
+          pumpOn();
+
+          changeState(WATERING);
+        } else {
+          pumpOff();
+          Serial.println("HIBA: max ontozesi ciklusszam elerve");
+          changeState(ERROR_STATE);
+        }
+      } else {
+        pumpOff();
+        Serial.println("NEM KELL ONTOZNI");
+
+        wateringCycles = 0;
+
+        changeState(IDLE);
+      }
+
+      break;
+    }
+
+    case WATERING: {
+      if (millis() - stateStartTime >= WATERING_TIME_MS) {
+        pumpOff();
+
+        Serial.println("PUMPA LEALL");
+        Serial.println("VARAKOZAS, HOGY A VIZ ELTERJEDJEN");
+
+        changeState(SOAK_WAIT);
+      }
+
+      break;
+    }
+
+    case SOAK_WAIT: {
+      if (millis() - stateStartTime >= SOAK_WAIT_MS) {
+        Serial.println("VARAKOZAS VEGE, UJRAMERES");
+
+        changeState(CHECK_SOIL);
+      }
+
+      break;
+    }
+
+    case IDLE: {
+      pumpOff();
+
+      if (millis() - stateStartTime >= 5000) {
+        changeState(CHECK_SOIL);
+      }
+
+      break;
+    }
+
+    case LOW_WATER_LOCKOUT: {
+      pumpOff();
+
+      if (!isWaterLow()) {
+        Serial.println("Vizszint rendben, tiltas feloldva");
+
+        wateringCycles = 0;
+
+        changeState(CHECK_SOIL);
+      } else {
+        Serial.println("LOW WATER LOCKOUT: toltsd fel a tartalyt");
+        delay(3000);
+      }
+
+      break;
+    }
+
+    case ERROR_STATE: {
+      pumpOff();
+
+      Serial.println("ERROR: rendszer megallitva, beavatkozas szukseges");
+      delay(3000);
+
+      break;
+    }
+  }
+}
